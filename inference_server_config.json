@@ -1,0 +1,12 @@
+{
+  "_comment": "ARARAT Inference Server — edit paths to match your RunPod environment",
+
+  "pp_dir": "/workspace/prostate_lesion_detection/preprocessed",
+  "exp_dir": "/workspace/prostate_lesion_detection/MDT_ProstateX/experiments/exp0",
+  "output_base_dir": "/workspace/prostate_lesion_detection/inference_job_outputs",
+  "viewer_infer_script": "/workspace/prostate_lesion_detection/viewer_infer.py",
+
+  "python_exe": "python",
+
+  "estimated_inference_seconds": 120
+}
