@@ -6,6 +6,11 @@ ProstateX_transforms/
 MDT_ProstateX/experiments/exp0/logs/*
 .Rhistory
 
+# Ararat Viewer Backend — runtime artifacts (never commit these)
+runtime_assets/
+inference_server.log
+viewer_output/
+
 #General: https://github.com/github/gitignore/blob/master/Python.gitignore
 # Byte-compiled / optimized / DLL files
 __pycache__/

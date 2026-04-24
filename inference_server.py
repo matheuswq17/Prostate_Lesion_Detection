@@ -6,7 +6,13 @@ FastAPI server that wraps viewer_infer.py for the ARARAT Viewer remote inference
 API contract (matches RemoteInferenceClient in the viewer):
 
   GET  /health
-       → {"status": "ok", "pp_dir_exists": bool, "exp_dir_exists": bool, "gpu": str}
+       → {"status": "ok",
+          "preprocessed_base_dir": str,
+          "preprocessed_base_dir_exists": bool,
+          "available_patients_count": int,
+          "available_patients": [str, ...],
+          "exp_dir_exists": bool,
+          "gpu": str}
 
   POST /api/lesion_inference/run
        Body: {"patient_id": str, "threshold": float, "fold": int}
@@ -81,7 +87,7 @@ def _load_config() -> dict:
 
 _cfg = _load_config()
 
-PP_DIR       = Path(_cfg.get("pp_dir",        _SCRIPT_DIR / "preprocessed"))
+PREPROCESSED_BASE_DIR = Path(_cfg.get("preprocessed_base_dir", _SCRIPT_DIR / "runtime_assets" / "preprocessed_cases"))
 EXP_DIR      = Path(_cfg.get("exp_dir",        _SCRIPT_DIR / "MDT_ProstateX" / "experiments" / "exp0"))
 OUTPUT_BASE  = Path(_cfg.get("output_base_dir", _SCRIPT_DIR / "inference_job_outputs"))
 VIEWER_INFER = Path(_cfg.get("viewer_infer_script", _SCRIPT_DIR / "viewer_infer.py"))
@@ -90,17 +96,66 @@ EST_SECONDS  = int(_cfg.get("estimated_inference_seconds", 120))
 
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
-logger.info(f"PP_DIR={PP_DIR}")
+logger.info(f"PREPROCESSED_BASE_DIR={PREPROCESSED_BASE_DIR}")
 logger.info(f"EXP_DIR={EXP_DIR}")
 logger.info(f"OUTPUT_BASE={OUTPUT_BASE}")
 logger.info(f"VIEWER_INFER={VIEWER_INFER}")
 logger.info(f"PYTHON={PYTHON_EXE}")
 
 # ---------------------------------------------------------------------------
+# Patient helpers
+# ---------------------------------------------------------------------------
+
+def _required_filenames(patient_id: str) -> list:
+    return [
+        f"{patient_id}_img.npy",
+        f"{patient_id}_rois.npy",
+        f"meta_info_{patient_id}.pickle",
+        "info_df.pickle",
+    ]
+
+
+def _list_available_patients() -> list:
+    if not PREPROCESSED_BASE_DIR.exists():
+        return []
+    return sorted(p.name for p in PREPROCESSED_BASE_DIR.iterdir() if p.is_dir())
+
+
+def _resolve_patient_dir(patient_id: str) -> Path:
+    """Return the patient's preprocessed directory, raising HTTPException on any problem."""
+    patient_dir = PREPROCESSED_BASE_DIR / patient_id
+    if not patient_dir.is_dir():
+        available = _list_available_patients()
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Patient not found: {patient_id}",
+                "searched_in": str(PREPROCESSED_BASE_DIR),
+                "available_patients": available,
+            },
+        )
+    missing = [
+        fname for fname in _required_filenames(patient_id)
+        if not (patient_dir / fname).exists()
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": f"Missing required files for patient {patient_id}",
+                "patient_dir": str(patient_dir),
+                "missing_files": missing,
+                "required_files": _required_filenames(patient_id),
+            },
+        )
+    return patient_dir
+
+
+# ---------------------------------------------------------------------------
 # Job registry (in-memory, keyed by UUID string)
 # ---------------------------------------------------------------------------
 
-_JOBS: dict[str, dict] = {}
+_JOBS: dict = {}
 _JOBS_LOCK = threading.Lock()
 
 # Only these three filenames are served via /download
@@ -109,22 +164,23 @@ _ALLOWED_FILES = frozenset(
 )
 
 
-def _new_job(patient_id: str, threshold: float, fold: int) -> dict:
+def _new_job(patient_id: str, threshold: float, fold: int, patient_pp_dir: Path) -> dict:
     jid = str(uuid.uuid4())
     out_dir = str(OUTPUT_BASE / f"job_{jid}")
     os.makedirs(out_dir, exist_ok=True)
     return {
-        "job_id":        jid,
-        "status":        "pending",
-        "patient_id":    patient_id,
-        "threshold":     threshold,
-        "fold":          fold,
-        "created_at":    time.time(),
-        "started_at":    None,
-        "completed_at":  None,
-        "output_dir":    out_dir,
-        "message":       "queued",
-        "log_tail":      [],
+        "job_id":         jid,
+        "status":         "pending",
+        "patient_id":     patient_id,
+        "patient_pp_dir": str(patient_pp_dir),
+        "threshold":      threshold,
+        "fold":           fold,
+        "created_at":     time.time(),
+        "started_at":     None,
+        "completed_at":   None,
+        "output_dir":     out_dir,
+        "message":        "queued",
+        "log_tail":       [],
     }
 
 
@@ -145,14 +201,15 @@ def _run_inference_thread(jid: str) -> None:
     if job is None:
         return
 
-    patient_id = job["patient_id"]
-    fold       = job["fold"]
-    out_dir    = job["output_dir"]
+    patient_id     = job["patient_id"]
+    fold           = job["fold"]
+    out_dir        = job["output_dir"]
+    patient_pp_dir = job["patient_pp_dir"]
 
     cmd = [
         PYTHON_EXE, str(VIEWER_INFER),
         "--patient_id", patient_id,
-        "--pp_dir",     str(PP_DIR),
+        "--pp_dir",     patient_pp_dir,
         "--output_dir", out_dir,
         "--exp_dir",    str(EXP_DIR),
         "--fold",       str(fold),
@@ -161,7 +218,7 @@ def _run_inference_thread(jid: str) -> None:
     logger.info(f"[JOB {jid[:8]}] cmd: {' '.join(cmd)}")
     _patch_job(jid, status="running", started_at=time.time(), message="inference running")
 
-    log_lines: list[str] = []
+    log_lines: list = []
     try:
         proc = subprocess.Popen(
             cmd,
@@ -222,11 +279,11 @@ def _run_inference_thread(jid: str) -> None:
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="ARARAT Inference Server", version="1.0.0")
+app = FastAPI(title="ARARAT Inference Server", version="2.0.0")
 
 
 class _InferRequest(BaseModel):
-    patient_id: str  = Field(...,  description="e.g. ProstateX-0085")
+    patient_id: str   = Field(...,  description="e.g. ProstateX-0085")
     threshold:  float = Field(0.30, ge=0.0, le=1.0)
     fold:       int   = Field(0,    ge=0,   le=4)
 
@@ -234,28 +291,24 @@ class _InferRequest(BaseModel):
 @app.get("/health")
 def health():
     """Liveness probe — viewer calls this before every submission."""
+    available_patients = _list_available_patients()
     return {
-        "status":          "ok",
-        "pp_dir_exists":   PP_DIR.exists(),
-        "exp_dir_exists":  EXP_DIR.exists(),
-        "gpu":             _gpu_summary(),
+        "status":                       "ok",
+        "preprocessed_base_dir":        str(PREPROCESSED_BASE_DIR),
+        "preprocessed_base_dir_exists": PREPROCESSED_BASE_DIR.exists(),
+        "available_patients_count":     len(available_patients),
+        "available_patients":           available_patients,
+        "exp_dir_exists":               EXP_DIR.exists(),
+        "gpu":                          _gpu_summary(),
     }
 
 
 @app.post("/api/lesion_inference/run")
 def submit_job(req: _InferRequest, background_tasks: BackgroundTasks):
     """Accept a job, launch viewer_infer.py in a daemon thread, return job_id."""
-    img_path = PP_DIR / f"{req.patient_id}_img.npy"
-    if not img_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Preprocessed image not found: {img_path}\n"
-                f"Expected  {req.patient_id}_img.npy  in pp_dir={PP_DIR}"
-            ),
-        )
+    patient_pp_dir = _resolve_patient_dir(req.patient_id)
 
-    job = _new_job(req.patient_id, req.threshold, req.fold)
+    job = _new_job(req.patient_id, req.threshold, req.fold, patient_pp_dir)
     jid = job["job_id"]
     with _JOBS_LOCK:
         _JOBS[jid] = job

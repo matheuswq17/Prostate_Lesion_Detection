@@ -109,13 +109,51 @@ If you have any problems, please check further instructions in each of the provi
 
 This section documents the backend interface between the **Ararat Viewer** and this repository.
 
-### New files
+### Files
 
 | File | Purpose |
 |---|---|
-| `viewer_infer.py` | Main inference entrypoint — call this from the Viewer |
+| `inference_server.py` | FastAPI server — wraps `viewer_infer.py` for the Viewer's RemoteInferenceClient |
+| `inference_server_config.json` | Runtime config for `inference_server.py` (paths, Python exe) |
+| `viewer_infer.py` | Direct inference entrypoint — subprocess-callable, outputs JSON + npy |
 | `viewer_env_check.py` | Validates the entire inference environment |
 | `viewer_preprocess_stub.py` | Format validator + preprocessing documentation |
+
+### Preprocessed cases — expected structure
+
+The server resolves each patient's data from a single base directory
+(`preprocessed_base_dir` in the config).  Each patient gets its own subdirectory:
+
+```
+runtime_assets/preprocessed_cases/
+  ProstateX-0085/
+    ProstateX-0085_img.npy          ← float32 (z, y, x, 8), channels last
+    ProstateX-0085_rois.npy         ← float32 (z, y, x, 1)
+    meta_info_ProstateX-0085.pickle
+    info_df.pickle
+  ProstateX-0004/
+    ProstateX-0004_img.npy
+    ProstateX-0004_rois.npy
+    meta_info_ProstateX-0004.pickle
+    info_df.pickle
+  ...
+```
+
+Channels (in order): T2, B500, B800, ADC, Ktrans, Perf_1, Perf_2, Perf_3.
+
+To add a new patient, create its subdirectory with all four required files.
+The server will discover it automatically — no config change needed.
+
+### inference_server_config.json
+
+| Key | Description |
+|---|---|
+| `preprocessed_base_dir` | Path to the folder containing one subdirectory per patient |
+| `exp_dir` | Path to `exp0_runtime` (model checkpoints) |
+| `output_base_dir` | Where per-job output directories are written |
+| `viewer_infer_script` | Absolute path to `viewer_infer.py` |
+| `python_exe` | Python executable in the inference conda env |
+| `estimated_inference_seconds` | Used to compute pseudo-progress (default 120) |
 
 ### Step 1 — Validate the environment
 
@@ -127,34 +165,62 @@ python viewer_env_check.py
 This checks Python, PyTorch, CUDA, compiled extensions, checkpoints, and image data.
 Fix any `[FAIL]` items before proceeding (see output for specific install commands).
 
-### Step 2 — Ensure the patient image exists
+### Step 2 — Populate preprocessed cases
 
-`viewer_infer.py` requires a preprocessed 8-channel image:
+Copy or symlink the preprocessed patient directories into `preprocessed_base_dir`
+(the path set in `inference_server_config.json`).
 
-```
-{pp_dir}/{patient_id}_img.npy   ← float32, shape (x, y, z, 8), channels last
-```
-
-Channels (in order): T2, B500, B800, ADC, Ktrans, Perf_1, Perf_2, Perf_3
-
-For existing ProstateX patients, these files are in `out/` after running
-`ProstateX preprocessing.ipynb`. For new patients, preprocessing must be
-run equivalently (see `viewer_preprocess_stub.py` for the format spec).
-
-To verify a patient's data:
+To verify a single patient's files are complete:
 ```bash
-python viewer_preprocess_stub.py out/ ProstateX-0001
+python viewer_preprocess_stub.py runtime_assets/preprocessed_cases ProstateX-0085
 ```
 
-### Step 3 — Run inference
+### Step 3 — Start the server
+
+```bash
+conda activate prostate_lesion
+python inference_server.py --host 0.0.0.0 --port 8000
+```
+
+Verify with:
+```bash
+curl http://localhost:8000/health
+# → {"status":"ok", "preprocessed_base_dir_exists":true,
+#    "available_patients_count":2, "available_patients":["ProstateX-0004","ProstateX-0085"], ...}
+```
+
+### Step 4 — Submit a job
+
+```bash
+curl -X POST http://localhost:8000/api/lesion_inference/run \
+  -H "Content-Type: application/json" \
+  -d '{"patient_id":"ProstateX-0085","threshold":0.30,"fold":0}'
+# → {"status":"submitted","job_id":"<uuid>"}
+```
+
+Poll status and download results as usual via `/api/lesion_inference/status/<job_id>`
+and `/api/lesion_inference/download/<job_id>/<filename>`.
+
+### Error responses
+
+| Situation | Status | `detail.error` |
+|---|---|---|
+| Patient directory missing | 404 | `"Patient not found: <id>"` + `available_patients` list |
+| Required file(s) missing | 422 | `"Missing required files…"` + `missing_files` list |
+| Job not found | 404 | `"Job not found: <id>"` |
+| Download before completion | 409 | `"Job not completed yet"` |
+
+### Running viewer_infer.py directly (without the server)
 
 ```bash
 python viewer_infer.py \
-  --patient_id ProstateX-0001 \
-  --pp_dir     out/ \
-  --output_dir viewer_output/ProstateX-0001 \
+  --patient_id ProstateX-0085 \
+  --pp_dir     runtime_assets/preprocessed_cases/ProstateX-0085 \
+  --output_dir viewer_output/ProstateX-0085 \
   --fold       0
 ```
+
+Exit codes: `0` = success, `2` = environment error, `3` = input error, `4` = inference error.
 
 ### Output files
 
@@ -165,41 +231,18 @@ python viewer_infer.py \
 | `inference_metadata.json` | Run metadata (timing, GPU, shapes) |
 | `inference.log` | Full execution log |
 
-### Calling from the Viewer (subprocess)
-
-```python
-import subprocess, json, numpy as np
-
-proc = subprocess.run([
-    "conda", "run", "-n", "prostate_lesion",
-    "python", r"C:\Ararat-Lesions-Detection\prostate_lesion_detection\viewer_infer.py",
-    "--patient_id", patient_id,
-    "--pp_dir",     pp_dir,
-    "--output_dir", output_dir,
-], capture_output=True, text=True)
-
-if proc.returncode == 0:
-    with open(os.path.join(output_dir, "lesion_result.json")) as f:
-        result = json.load(f)          # detections list
-    mask = np.load(os.path.join(output_dir, "lesion_mask.npy"))  # probability map
-else:
-    print("Inference failed:", proc.stderr)
-```
-
-Exit codes: `0` = success, `2` = environment error, `3` = input error, `4` = inference error.
-
 ### Real limitations (honest)
 
 1. **CUDA required** — the MDT model unconditionally calls `.cuda()`. No CPU fallback.
 2. **CUDA extensions must be compiled** — NMS and RoIAlign C++/CUDA extensions need `python setup.py install`.
 3. **PyTorch must be installed** — the `prostate_lesion` conda env currently only has pandas + SimpleITK. Install PyTorch 1.7 + CUDA first.
 4. **Image must be preprocessed** — raw DICOM → MDT format requires `ProstateX preprocessing.ipynb`. A fully programmatic DICOM pipeline is not yet implemented.
-5. **ProstateX patients only (MVP)** — `out/` contains metadata for ~346 ProstateX patients. New patients need preprocessing to be run first.
+5. **No automatic preprocessing** — new patients must be preprocessed manually and placed in `preprocessed_base_dir/<patient_id>/` before the server can serve them.
 
-### What still needs to be done after this MVP
+### What still needs to be done
 
 - [ ] Install PyTorch + batchgenerators in `prostate_lesion` env and compile CUDA extensions
-- [ ] End-to-end test on a real ProstateX patient from `out/`
+- [ ] End-to-end test on a real ProstateX patient
 - [ ] Implement `preprocess_dicom_to_npy()` in `viewer_preprocess_stub.py` (extracts logic from notebook)
 - [ ] Viewer-side integration: load `lesion_mask.npy` as DICOM RT Struct or overlay
 - [ ] Multi-fold ensemble (current MVP uses fold 0 only)

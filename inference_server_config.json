@@ -1,5 +1,5 @@
 {
-  "pp_dir": "/workspace/repos/Prostate_Lesion_Detection/runtime_assets/out_runtime_ProstateX-0085",
+  "preprocessed_base_dir": "/workspace/repos/Prostate_Lesion_Detection/runtime_assets/preprocessed_cases",
   "exp_dir": "/workspace/repos/Prostate_Lesion_Detection/runtime_assets/exp0_runtime",
   "output_base_dir": "/workspace/ararat_api/inference_job_outputs",
   "viewer_infer_script": "/workspace/repos/Prostate_Lesion_Detection/viewer_infer.py",
