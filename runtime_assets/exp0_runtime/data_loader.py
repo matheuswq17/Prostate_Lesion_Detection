@@ -30,6 +30,54 @@ a pandas dataframe in the same directory containing the meta-info e.g. labels, f
 
 
 import numpy as np
+
+def _relabel_seg_dense(seg):
+    """
+    Force foreground labels to be contiguous: 1..N
+    """
+    seg = np.asarray(seg)
+    fg_labels = [int(v) for v in np.unique(seg) if v > 0]
+
+    if len(fg_labels) == 0:
+        return seg.astype(np.uint8), 0
+
+    out = np.zeros_like(seg, dtype=np.uint8 if len(fg_labels) < 256 else np.int16)
+    for new_id, old_id in enumerate(fg_labels, start=1):
+        out[seg == old_id] = new_id
+    return out, len(fg_labels)
+
+
+def _normalize_class_targets(raw_targets, expected_n_rois, pid):
+    """
+    Normalize class_target to flat 1D int64 vector with length N_rois
+    """
+    arr = np.asarray(raw_targets)
+    arr = np.squeeze(arr)
+
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+
+    arr = arr.astype(np.int64).reshape(-1)
+
+    if expected_n_rois == 0:
+        return arr[:0]
+
+    if arr.size == expected_n_rois:
+        return arr
+
+    if arr.size == 1 and expected_n_rois > 1:
+        print(
+            f"[CLASS_TARGET_FIX] pid={pid} singleton class_target detected; "
+            f"repeating {arr.tolist()} to match n_rois={expected_n_rois}"
+        )
+        return np.repeat(arr, expected_n_rois)
+
+    raise ValueError(
+        f"[CLASS_TARGET_FIX] pid={pid} class_target mismatch: "
+        f"raw={repr(raw_targets)} normalized_shape={arr.shape} "
+        f"normalized={arr.tolist()} expected_n_rois={expected_n_rois}"
+    )
+
 import os
 from collections import OrderedDict
 import pandas as pd
@@ -393,7 +441,21 @@ class PatientBatchIterator(SlimDataLoaderBase):
         # data shape: from (c, z, y, x) to (c, y, x, z).
         data = np.transpose(np.load(patient['data'], mmap_mode='r'), axes=(3, 1, 2, 0)).copy()
         seg = np.transpose(np.load(patient['seg'], mmap_mode='r'), axes=(3, 1, 2, 0))[0].copy()
-        batch_class_targets = np.array([patient['class_target']])
+        pid = patient['pid']
+
+        seg, n_rois = _relabel_seg_dense(seg)
+        norm_targets = _normalize_class_targets(patient['class_target'], n_rois, pid)
+        batch_class_targets = norm_targets[np.newaxis, :]
+
+        print(
+            f"[CLASS_TARGET_FIX] pid={pid} "
+            f"seg_shape={seg.shape} "
+            f"seg_fg_labels={[int(v) for v in np.unique(seg) if v > 0]} "
+            f"n_rois={n_rois} "
+            f"class_target_raw={repr(patient['class_target'])} "
+            f"class_target_norm_shape={batch_class_targets.shape} "
+            f"class_target_norm={batch_class_targets.tolist()}"
+        )
 
         # pad data if smaller than patch_size seen during training.
         if np.any([data.shape[dim + 1] < ps for dim, ps in enumerate(self.patch_size)]):
